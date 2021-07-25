@@ -1,0 +1,594 @@
+---
+title: "Predictive Maintenance of Turbofan Engines"
+subtitle: "Building a Remaining Useful Life Prediction System Based on the NASA FD001 Dataset"
+author: "Tibor Nagy"
+output:
+  pdf_document: 
+    toc: true
+    toc_depth: 2
+  html_document:
+    df_print: paged
+  word_document: default
+  urlcolor: blue
+---
+\pagebreak
+
+```{r Required_packages, message=FALSE, warning=FALSE, include=FALSE}
+# List of packages for session
+.packages = c("tidyverse", "knitr", "caret", "randomForest", "rpart", "ggpubr", "survival", "survminer",
+              "kernlab", "ggridges")
+
+# Install missing packages
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages
+lapply(.packages, require, character.only=TRUE)
+```
+
+```{r Loading_data, message=FALSE, warning=FALSE, include=FALSE}
+#Downloading the data
+dl <- tempfile()
+download.file("https://drive.google.com/uc?export=download&id=1OZ7oS6CO6TSvUNRfjX70ApqBEtcBf2Um", dl)
+train_FD001 <- read.delim(dl, header = FALSE, sep = "", dec = ".")
+
+download.file("https://drive.google.com/uc?export=download&id=1ki9J33OA8-_E-hA_YPmmoS2joYH094NB", dl)
+test_FD001 <- read.delim(dl, header = FALSE, sep = "", dec = ".")
+
+download.file("https://drive.google.com/uc?export=download&id=1lip3QctzuadXp4-rk8IE3rpu4DTEyVbY", dl)
+RUL_FD001 <- read.delim(dl, header = FALSE, sep = "", dec = ".")
+
+
+names(train_FD001) <- c("unit_no", "time_cycles", "op_1", "op_2", "op_3", "s_01", "s_02", "s_03", "s_04", "s_05", "s_06",
+                        "s_07", "s_08", "s_09", "s_10", "s_11", "s_12", "s_13", "s_14", "s_15", "s_16", "s_17",
+                        "s_18", "s_19", "s_20", "s_21")
+
+names(test_FD001) <- c("unit_no", "time_cycles", "op_1", "op_2", "op_3", "s_01", "s_02", "s_03", "s_04", "s_05", "s_06",
+                        "s_07", "s_08", "s_09", "s_10", "s_11", "s_12", "s_13", "s_14", "s_15", "s_16", "s_17",
+                        "s_18", "s_19", "s_20", "s_21")
+
+names(RUL_FD001) <- "RUL"
+```
+
+# 1.	Introduction
+
+In this paper I will try to build a prediction system which predicts the Remaining Useful Life (RUL) for the turbofan engines included in the NASA’s FD001 dataset. This is one of the four datasets NASA released in a data challenge competition. It includes Run-to-Failure simulated data from turbo fan jet engines. It consists of one operational condition (sea level) and one failure mode (HPC Degradation). The goal is to predict the RUL of each engine in the test subset, based on 3 operational settings and the readings of 21 sensors.   
+Why am I interested in this dataset after more than a decade it was released? I stumbled upon this when I was searching for a dataset for my capstone project in a data science training course. I chose an easier dataset then, but I realized that analyzing this can be good introduction to the predictive maintenance of any machines. The dataset does not include the name of the sensors and operational settings, thus we cannot use any domain knowledge. Our results are based on applying the correct techniques. We can easily use these techniques for the predictive maintenance of other machines. 
+I did not find any R based comprehensive analysis of this dataset on the net to learn from. I am still new in data science, so I decided to make my own analysis to learn, and to gain some experience in applying some of the most popular and computationally light methods.
+
+
+# 2. Exploratory Data Analysis
+
+At first, we need to be familiarized with the 3 subsets of the FD001 dataset (_train\_FD001, test\_FD001, RUL\_FD001_) we are working with.
+
+## 2.1 Experimental Scenario
+
+The datasets consist of multiple multivariate time series. Each dataset is further divided into training and test subsets. Each time series is from a different engine – i.e., the data can be considered to be from a fleet of engines of the same type. Each engine starts with different degrees of initial wear and manufacturing variation which is unknown to the user. This wear and variation is considered normal, i.e., it is not considered a fault condition. There are three operational settings that have a substantial effect on engine performance. These settings are also included in the data. The data is contaminated with sensor noise.  
+The engine is operating normally at the start of each time series, and develops a fault at some point during the series. In the training set, the fault grows in magnitude until system failure. In the test set, the time series ends some time prior to system failure. The objective is to predict the number of remaining operational cycles before failure in the test set, i.e., the number of operational cycles after the last cycle that the engine will continue to operate. Also provided a vector of true Remaining Useful Life (RUL) values for the test data. 
+Each row is a snapshot of data taken during a single operational cycle, each column is a different variable. The columns correspond to:  
+
+1,	unit number  
+2,	time, in cycles  
+3,	operational setting 1  
+4,	operational setting 2  
+5,	operational setting 3  
+6,	sensor measurement 1  
+7,	sensor measurement 2  
+...  
+26,	sensor measurement 21  
+
+\pagebreak
+
+## 2.2 Dataset Dimensions
+
+I will use the _train\_FD001_ as the training set and save the _test\_FD001_ and _RUL\_FD001_ for evaluating the overall accuracy of the final algorithm. Both the train and test sets consist of 100 trajectories.
+
+```{r Table1_Dataset_Dimensions, echo=FALSE, message=FALSE, warning=FALSE}
+Table_1 <- data.frame(
+  Dataset = c("train_FD001", "test_FD001"),
+  No_of_Rows = c(nrow(train_FD001), nrow(test_FD001)),
+  No_of_Cols = c(ncol(train_FD001), ncol(test_FD001)))
+
+knitr::kable(
+  Table_1,
+  format = "pipe",
+  caption = "Dataset Dimensions",
+  col.names = c("Dataset", "No. of Rows", "No. of Columns"))
+```
+
+
+## 2.3 Preview of the Dataset
+
+```{r Table3_Dataset_Structure, echo=FALSE, message=FALSE, warning=FALSE}
+train_FD001 %>%
+  select(1:11) %>%
+  head() %>% 
+  knitr::kable(format = "pipe", caption = "Preview of the dataset")
+```
+
+```{r Table4_Dataset_Structure2, echo=FALSE, message=FALSE, warning=FALSE}
+train_FD001 %>%
+  select(12:23) %>%
+  head() %>% 
+  knitr::kable(format = "pipe", caption = "Preview of the dataset")
+```
+
+```{r Table5_Dataset_Structure3, echo=FALSE, message=FALSE, warning=FALSE}
+train_FD001 %>%
+  select(24:26) %>%
+  head() %>% 
+  knitr::kable(format = "pipe", caption = "Preview of the dataset")
+```
+
+## 2.4	Distribution of Time Cycles
+
+In the following plot we can see the distribution of the maximum operational _time\_cycles_ of the engines. 
+
+```{r Plot1_Time_Cycles_Distribution, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+train_FD001 %>%
+  group_by(unit_no) %>%
+  summarise(n=n(), time_cycles = max(time_cycles)) %>%
+  ggplot(aes(time_cycles)) +
+  geom_histogram(binwidth = 10, color = "black") +
+  labs(title="Maximum Time Cycles", x = "Time Cycles", y = "Count")
+```
+
+This is clearly not a normal distribution. The maximum of the curve is around 200 cycles. Most engines fail around the maximum, but some of them functioning over 300 cycles.
+
+
+# 3. Preprocessing
+
+In machine learning, we must examine the predictors before running the machine algorithms.
+It is often needed to transform the predictors for some reason. We also remove predictors that are clearly not useful. 
+
+## 3.1 Adding a RUL column
+For the predictions we need the RUL feature, but unfortunately the train set does not contain it. I computed it with the following equation, after grouping the data by _unit\_no_.  
+
+_RUL = max(time\_cycle) - time\_cycle_
+
+
+## 3.2 Sensor Reading Curves
+
+Due to the large number of the sensors and engines, I will not print the sensor readings for each sensor and engine. Instead, I randomly selected 10 engines. I noticed the sensors can be divided into 5 groups. A sample plot for each group is shown below.
+
+```{r Plot2_Sensor_Reading_Curves, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+#Adding a RUL column to the train set
+train_FD001 <- train_FD001 %>% group_by(unit_no) %>% mutate(max_tc = max(time_cycles)) %>% 
+  mutate(RUL = max_tc - time_cycles) %>% select(-max_tc)
+
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+sample_unit <- sample(seq(1:100), 10, replace = FALSE)
+
+plot_df <- train_FD001 %>% filter(unit_no %in% sample_unit)
+
+plot1 <- plot_df %>% ggplot(aes(x = RUL, y = s_03, group = unit_no)) +
+  geom_line(color = plot_df$unit_no) +
+  labs(title="s_03 sensor readings") +
+  scale_x_reverse()+
+  theme(legend.position = "none")
+
+plot2 <- plot_df %>% ggplot(aes(x = RUL, y = s_07, group = unit_no)) +
+  geom_line(color = plot_df$unit_no) +
+  labs(title="s_07 sensor readings") +
+  scale_x_reverse()+
+  theme(legend.position = "none")
+
+plot3 <- plot_df %>% ggplot(aes(x = RUL, y = s_05, group = unit_no)) +
+  geom_line(color = plot_df$unit_no) +
+  labs(title="s_05 sensor readings") +
+  scale_x_reverse()+
+  theme(legend.position = "none")
+
+plot4 <- plot_df %>% ggplot(aes(x = RUL, y = s_06, group = unit_no)) +
+  geom_line(color = plot_df$unit_no) +
+  labs(title="s_06 sensor readings") +
+  scale_x_reverse()
+
+plot5 <- plot_df %>% ggplot(aes(x = RUL, y = s_14, group = unit_no)) +
+  geom_line(color = plot_df$unit_no) +
+  labs(title="s_14 sensor readings") +
+  scale_x_reverse()+
+  theme(legend.position = "none")
+
+ggarrange(plot1, plot2, plot3, plot4, plot5, ncol = 2, nrow = 3)
+
+```
+
+* Group 1: Sensors 2, 3, 4, 8, 11, 13, 15 and 17 show an inclining trend.  
+* Group 2: Sensors 7, 12, 20 and 21 show a declining trend.  
+* Group 3: Sensors 1, 5, 10, 16, 18 and 19 show a constant trend.  
+* Group 4: Sensor 6 is unique. It shows a constant trend with some downward spikes.  
+* Group 5: Sensor 9 has a similar pattern as sensor 14, they show a different trend for each engine.
+
+##  3.2 Removing Features
+
+Features that have no clear relation to the RUL do not contain useful information, so they can be removed. These are the readings of sensors 1, 5, 6, 9, 10, 14, 16, 18 and 19. 
+I also dropped the operational settings, because I do not need them in the further analysis.
+
+```{r Removing_Features, message=FALSE, warning=FALSE, include=FALSE}
+train_FD001 <- subset(train_FD001, select = - c(op_1, op_2, op_3, s_01, s_05, s_06, s_09, s_10, s_14, s_16, s_18, s_19))
+test_FD001 <- subset(test_FD001, select = - c(op_1, op_2, op_3, s_01, s_05, s_06, s_09, s_10, s_14, s_16, s_18, s_19))
+```
+
+## 3.3 Decomposing the sensor reading curves
+
+We can see from the sensor reading plots, that the curves of the readings are quite wiggly.  We can improve our model’s performance if we smooth the curves, remove the noise and keep the smoothed trends only. To estimate the trends I used the _loess()_  function.
+
+```{r Decomposing_Sens_Curves, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+remaining_sens <- c("s_02", "s_03", "s_04", "s_07", "s_08", "s_11", "s_12", "s_13", 
+                    "s_15", "s_17", "s_20", "s_21")
+
+#Smoothing the train set
+for (i in remaining_sens) {x <- paste(i,"trend", sep = "_")
+train_FD001 <- train_FD001 %>%
+  group_by(unit_no) %>%
+  mutate(!!x := fitted(loess(get(i) ~ time_cycles, span = 0.5)))%>%
+  ungroup()}
+
+#Smoothing the test set
+for (i in remaining_sens) {x <- paste(i,"trend", sep = "_")
+test_FD001 <- test_FD001 %>%
+  group_by(unit_no) %>%
+  mutate(!!x := fitted(loess(get(i) ~ time_cycles, span = 0.5)))%>%
+  ungroup()}
+```
+
+We can see an example of the results on the following chart.
+
+```{r Plot3_Sensor_Trend_Curves, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+train_FD001 %>% filter(unit_no == 1) %>% ggplot(aes(x = time_cycles, y = s_07_trend)) +
+  geom_line(aes(color = "s_07_trend"), col = "blue") +
+  geom_line(aes(x = time_cycles, y = s_07, color = "s_07"), col = "darkgrey") +
+  labs(title="unit_no 1, s_07 sensor readings")
+```
+
+## 3.4 Performance Evaluation
+
+NASA did not use RMSE for performance evaluation, they used the following custom algorithm that penalize late predictions more heavily than early predictions instead.  
+
+$$s = \sum_{i=1}^{n} e^{\frac{-d}{10}}-1\ for \ d < 0 $$
+$$s = \sum_{i=1}^{n} e^{\frac{d}{13}}-1\  for \ d \ge 0 $$
+
+where 
+_s_ is the computed score,
+_n_ is the number of UUTs,
+$$d = \hat{t}_{RUL} – t_{RUL} \ (Estimated RUL – True RUL).$$
+```{r Plot4_NASA_Score_Curve, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width="50%"}
+error <- seq(from = -50, to = 50 )
+
+Score <- sapply(error, function(d){out <- ifelse(d >= 0, exp(d/10)-1, exp(-d/13)-1) 
+                return(out)})
+
+Score <- cbind(error, Score)
+Score <- as.data.frame(Score) 
+
+Score %>% ggplot(aes(x = error, y = Score)) +
+  geom_line() +
+  labs(title="NASA Score", x = "Error", y = "NASA Score")
+```
+
+This makes the model building a bit more challenging, because in default the _train()_ function optimizes for RMSE. Fortunately, we can pass our custom optimality criterion (_NASA\_Score_) to the _train()_ function by using the _summaryFunction_ argument in the _trainControl()_ function.  
+
+```{r NASA_Score, echo=TRUE, message=FALSE, warning=FALSE}
+NASA_Score <- function(data, lev = NULL, model = NULL){
+  d <- data[, "pred"]- data[, "obs"]
+  out <- ifelse(d >= 0, exp(d/10)-1, exp(-d/13)-1)
+  out_sum <- sum(out)
+  names(out_sum) <- "NASA_Score"
+  return(out_sum)}
+```
+
+
+# 4. Models
+
+## 4.1 Kaplan-Meier Model
+
+The Kaplan-Meier is a very popular and widely used method in survival analysis. It shows us how does a survival function that describes engine survival over time looks like. It requires the serial time of the engine (time_cycles) and the engine status (broken down or functioning) at the end of the serial time. It only gives the probability that an engine will survive past a particular time. We cannot extrapolate the results beyond that time. It means we cannot make predictions for the engines in the test set, we can apply this method to the train set only.  
+Our train set does not contain the engine status, so I added a new _status_ column. The status is _0_ if the engine is functioning, _1_ if it is broken down. For the Kaplan-Meier survival curve we need the rows where the status is _1_. 
+From the curve above we can see that the survival probability below 125 cycles is 100%.
+
+```{r Plot4_Kaplan_Meier_Curve, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+train_FD001 <- train_FD001 %>% group_by(unit_no) %>% mutate(event = ifelse(RUL == 0, 1, 0))
+
+#Kaplan-Meier Model
+KM_df <- train_FD001 %>% filter(event==1)
+survival_model <- Surv(time = KM_df$time_cycles, event = KM_df$event)
+kaplan_fit <- survfit(survival_model ~ 1, data = KM_df)
+ggsurvplot(kaplan_fit, data = KM_df,
+           xlab = "Cycles", 
+           ylab = "Overall survival probability")
+
+```
+
+## 4.2 Baseline Linear Regression Model
+
+From the sensor reading plots we can see that the trends of the remaining sensors below some hundred cycles are almost horizontal. This means we cannot give accurate predictions about the RUL using these readings, we can remove them from the dataset. I will try some cutoffs to see which cutoff yields the best improvement on our model. To avoid overtraining I divided the _train\_FD001_ set to a train set and a test set temporarily that contains the 80% and the 20% of the units respectively. I removed the first 1/3 of data for each unit from the test set, and selected one random row for each unit to make the predictions and choose the best cutoff. 
+
+```{r Creating_temporary_test_set, echo=FALSE, message=FALSE, warning=FALSE}
+#Divide train_FD001 to a test and a train set	
+set.seed(1, sample.kind="Rounding")
+test_units <- sample(seq(1:100), 20, replace =FALSE)
+train_set <- train_FD001 %>% filter(!unit_no %in% test_units)
+test_set <- train_FD001 %>% filter(unit_no %in% test_units)
+test_set <- test_set %>% filter(time_cycles >= 100) %>% group_by(unit_no) %>% 
+  slice_sample(n=1)
+```
+
+```{r Best_Cutoff, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+##Trying of the linear regression model with different cutoffs
+cutoffs <- seq(from = 100, to = 150, by =5)
+fitControl <- trainControl(summaryFunction = NASA_Score)
+
+##Concatenate strings to create a formula
+remaining_sens_trend <- paste(remaining_sens, "trend", sep = "_")
+f <- paste(remaining_sens_trend,collapse=' + ')
+f <- paste('RUL ~',f)
+
+##Convert to formula
+f <- as.formula(f)
+
+##Scoring function for evaluation of the results
+Scoring_func <- function(pred, obs){
+  d <- pred-obs
+  out <- ifelse(d >= 0, exp(d/10)-1, exp(-d/13)-1)
+  out_sum <- sum(out)
+  return(out_sum)}
+
+##RMSE function for evaluation of the results
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))}
+
+##The lm model
+lm_result <- sapply(cutoffs, function(x){
+  df <- train_set %>% filter(time_cycles >= x)
+  lm_fit <- train(f, data = df, method = "lm",  maximize=FALSE, trControl = fitControl)
+  ft <- predict(lm_fit, newdata = test_set)
+  Sc <- Scoring_func(ft, test_set$RUL)
+  return(Sc)})
+lm_result <- as.data.frame(cbind(cutoffs, lm_result))
+
+best_cutoff <- lm_result$cutoffs[which.min(lm_result$lm_result)]
+
+```
+
+Then I used the _test\_FD001_ set for validation. The results are shown on the following graph. The best cutoff is at `r best_cutoff` time cycles.  
+
+```{r Plot5_Best_Cutoff, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+##The graph
+lm_result %>%
+  ggplot(aes(x = cutoffs, y = lm_result)) +
+  geom_line() +
+  labs(title="NASA Score vs. Cutoffs", x = "Cutoff", y = "NASA Score")
+```
+
+We could predict the RUL based on only the last observations of each unit, but in this case we drop the great majority of information from the test set, so probably there are other ways to achieve more accuracy. We could make predictions on the last _x_ cycles and average them. What value of _x_ would give the best accuracy? To find out I divided the _train\_FD001_ set to a train set and a test set temporarily again. For each unit in the test set, I selected a random row, and I kept the last _x_ rows that precede the random rows only. I tried _x’s_ from a range from 1 to 10.  
+
+```{r Scores_for_xs, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+##Divide train_FD001 to a test and a train set again	
+set.seed(1, sample.kind="Rounding") 
+test_units <- sample(seq(1:100), 20, replace =FALSE)
+train_set <- train_FD001 %>% filter(!unit_no %in% test_units)
+test_set <- train_FD001 %>% filter(unit_no %in% test_units)
+train_set <- train_set %>% filter(time_cycles >= best_cutoff)
+
+last_row <- test_set %>% filter(time_cycles >= 100) %>% group_by(unit_no) %>% 
+  slice_sample(n = 1) %>% select(unit_no, RUL)
+
+test_set2 <- test_set[0,] #Create an empty data frame based on the test_set
+
+for (i in test_units) {x <- test_set %>% filter(unit_no == i & RUL >= last_row$RUL[which(last_row$unit_no == i)])
+  test_set2 <- rbind(test_set2, x)} #Fill the empty data frame = test set
+
+lm_fit <- train(f, data = train_set, method = "lm",  maximize=FALSE, trControl = fitControl) 
+
+xs <- seq(1:10) #No. of rows for prediction
+
+##Computing the scores based different no. of rows (xs)
+lm_result <- sapply(xs, function(x){df <-  test_set2 %>% group_by(unit_no) %>% slice_tail(n = x)
+  df["pred"] <- predict(lm_fit, newdata = df)
+  df <- df %>% group_by(unit_no) %>% summarise(mean_pred = mean(pred), min_RUL = min(RUL))
+  res <- Scoring_func(df$mean_pred, df$min_RUL)
+  return(res)})
+
+lm_result <- as.data.frame(cbind(xs, lm_result))
+```
+
+```{r Plot6_Best_x, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+lm_result %>%
+  ggplot(aes(x = xs, y = lm_result)) +
+  geom_line() +
+  labs(title="NASA Score vs. x", x = "x", y = "NASA Score")
+```
+
+As we can see from the plot above, the relationship between the _NASA\_Score_ and the number of rows we use for prediction is almost linear. We obtain the best accuracy if we predict from the last row only. This is because the higher the RUL the more inaccurate the prediction gets. If we increase the number of rows we involve more and more inaccurate predictions into our model.  
+
+So for the final _lm_ model I used the entire _train\_FD001_ dataset with cutoff of `r best_cutoff`, and I made the predictions based on the last row of each unit.
+
+```{r Final_lm_model, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+##Final lm model
+##Selecting the last row for each unit in test_FD001
+test_FD001 <- test_FD001 %>% group_by(unit_no) %>% slice_tail(n=1)
+##Using the best cutoff on the train set
+train_FD001 <- train_FD001 %>% filter(time_cycles >= best_cutoff)
+##lm model
+lm_fit <- train(f, data = train_FD001, method = "lm",  maximize=FALSE, trControl = fitControl)
+##Prediction
+lm_pred <- predict(lm_fit, newdata = test_FD001)
+lm_pred <- ifelse(lm_pred < 0, 0, floor(lm_pred))
+lm_result_Score <- Scoring_func(lm_pred, RUL_FD001$RUL)
+lm_result_RMSE <- RMSE(lm_pred, RUL_FD001$RUL)
+lm_result <- RUL_FD001$RUL - lm_pred
+```
+
+```{r Table6_Final _lm_results, echo=FALSE, message=FALSE, warning=FALSE}
+Summary_Table <- data.frame(Method = "lm",
+                            Score = round(lm_result_Score),
+                            RMSE = round(lm_result_RMSE, digits = 4),
+                            Error = paste0("[", min(lm_result), ",", max(lm_result), "]"))
+
+Result_Summary <- function(){knitr::kable(Summary_Table, 
+                                          format = "pipe", 
+                                          caption = "Performance Metrics")}
+
+Result_Summary()
+```
+
+
+## 4.3 kNN model
+
+K-nearest neighbors (kNN) is a pattern recognition algorithm that uses training datasets to find the k closest relatives in future examples. When kNN is used in classification, we calculate to place data within the category of its nearest neighbor.
+I used the _train_ function from the _caret_ package to train the algorithm. To increase accuracy, the _train_ function performs 5-fold cross validation. For the kNN algorithm the tuning parameter is _k_. The default of the _train_ function is to try _k_= 5, 7, 9. To find the best accuracy I tried it on a much different scale: _k_= 70, 80, 90, 100.  
+
+```{r kNN_model, message=FALSE, warning=FALSE, include=FALSE}
+#fitControl <- trainControl(summaryFunction = NASA_Score, method = "cv", number=5)
+#set.seed(1, sample.kind="Rounding")
+#knn_fit <- train(f, data = train_FD001, method = "knn",  maximize=FALSE, trControl = fitControl, 
+                 #tuneGrid = data.frame(k = c(70, 80, 90, 100))) 
+
+#saveRDS(knn_fit, "knn_fit.rds")
+knn_fit <- readRDS("knn_fit.rds")
+
+##Prediction
+knn_pred <- predict(knn_fit, newdata = test_FD001)
+knn_pred <- ifelse(knn_pred < 0, 0, floor(knn_pred))
+knn_result_Score <- Scoring_func(knn_pred, RUL_FD001$RUL)
+knn_result_RMSE <- RMSE(knn_pred, RUL_FD001$RUL)
+knn_result <- RUL_FD001$RUL - knn_pred
+```
+
+```{r Plot7_k_Score, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ggplot(knn_fit, highlight = TRUE) +
+  ggtitle("k ~ NASA Score")
+```
+
+We can see that the _k_ value that gives the best accuracy is `r knn_fit$bestTune`. It is much larger than the default values of the _train_ function. The NASA Score on the test set is `r round(knn_result_Score)`, which is less than the half of the _lm_ method's score. We can see ~10% improvement in the RMSE too.
+
+
+```{r Table7_Final _knn_results, echo=FALSE, message=FALSE, warning=FALSE}
+Summary_Table <- Summary_Table %>% add_row(Method = "kNN", 
+                                           Score = round(knn_result_Score),
+                                           RMSE = round(knn_result_RMSE, digits = 4),
+                                           Error = paste0("[", min(knn_result), ",", max(knn_result), "]"))
+                                                    
+Result_Summary()
+```
+
+
+## 4.4 randomForest model
+
+The random forest algorithm is an expansion of decision tree. A decision tree is a learning algorithm that is perfect for classification problems, as it is able to order classes on a precise level. It works like a flow chart, separating data points into two similar categories at a time from the “tree trunk” to “branches”, to “leaves”, where the categories become more finitely similar. This creates categories within categories, allowing for organic classification with limited human supervision.  
+The randomForest improves prediction performance of the decision tree by averaging multiple decision trees (a forest of trees constructed with randomness).  
+To increase accuracy, I tried the tuning parameter _mtry_ values 3, 5, 7, 10, 12. 
+
+```{r RF_model, message=FALSE, warning=FALSE, include=FALSE}
+#fitControl <- trainControl(summaryFunction = NASA_Score)
+#rf_fit <- train(f, data = train_FD001, method = "rf",  maximize=FALSE, trControl = fitControl, 
+                 #tuneGrid = data.frame(mtry = c(3, 5, 7, 10, 12))) 
+
+#saveRDS(rf_fit, "rf_fit.rds")
+rf_fit <- readRDS("rf_fit.rds")
+
+##Prediction
+rf_pred <- predict(rf_fit, newdata = test_FD001)
+rf_pred <- ifelse(rf_pred < 0, 0, floor(rf_pred))
+rf_result_Score <- Scoring_func(rf_pred, RUL_FD001$RUL)
+rf_result_RMSE <- RMSE(rf_pred, RUL_FD001$RUL)
+rf_result <- RUL_FD001$RUL - rf_pred
+```
+
+```{r Plot8_mrty_Score, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ggplot(rf_fit, highlight = TRUE) +
+  ggtitle("mtry ~ NASA Score")
+```
+
+As we can see in the following plot the optimal _mtry_ is `r rf_fit$bestTune`. By further reducing the _mtry_ value we could end up with overfitting.  
+The result on the test set: 
+
+```{r Table8_Final _RF_results, echo=FALSE, message=FALSE, warning=FALSE}
+Summary_Table <- Summary_Table %>% add_row(Method = "RF", 
+                                           Score = round(rf_result_Score),
+                                           RMSE = round(rf_result_RMSE, digits = 4),
+                                           Error = paste0("[", min(rf_result), ",", max(rf_result), "]"))
+
+Result_Summary()
+```
+
+The Score is about the half of the linear model's, however the RMSE is just slightly better.
+
+## 4.5 SVR model
+
+The Support Vector Regression is an very popular, computationally light method. We can use it by calling the SVM (Support Vector Machine) function. It can be used for both regression and classification, because the function automatically detects if the data is categorical or continuous, and uses the applicable method to compute the results. We can choose from numerous kernels, which gives flexibility to the method. In this project I used the linear kernel, and performed 5-fold cross validation to increase accuracy. Using the linear kernel we can tune the method by trying the _Cost parameter_ on a scale. I tried the values of 1, 10, 20, 50, 75 and 100. 
+I normalized the variables to make their scale comparable by setting the _preProcess_ option to _center_ and _scale_. This is a very useful feature in terms of a distance-based model.
+
+
+```{r SVR_model, message=FALSE, warning=FALSE, include=FALSE}
+#fitControl <- trainControl(summaryFunction = NASA_Score, method = "cv", number=5)
+#set.seed(1, sample.kind="Rounding")
+#svr_fit <- train(f, data = train_FD001, method = "svmLinear",  preProc = c("center","scale"),
+                 #maximize=FALSE, trControl = fitControl, tuneGrid = expand.grid(C = c(1, 10, 20, 50, 75, 100))) 
+
+#saveRDS(svr_fit, "svr_fit.rds")
+svr_fit <- readRDS("svr_fit.rds")
+
+##Prediction
+svr_pred <- predict(svr_fit, newdata = test_FD001)
+svr_pred <- ifelse(svr_pred < 0, 0, floor(svr_pred))
+svr_result_Score <- Scoring_func(svr_pred, RUL_FD001$RUL)
+svr_result_RMSE <- RMSE(svr_pred, RUL_FD001$RUL)
+svr_result <- RUL_FD001$RUL - svr_pred
+```
+
+The plot below shows us the best _Cost parameter_ for this method is `r svr_fit$bestTune`.  
+
+
+```{r Plot9_C_Score, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ggplot(svr_fit, highlight = TRUE) + 
+  ggtitle("Cost parameter ~ NASA Score")
+```
+
+This is a simple method, there is no surprise in it's performance. In terms of scores it performs much better than the baseline linear method, on the same level as the two remaining models. 
+
+```{r Table9_Final_SVM_results, echo=FALSE, message=FALSE, warning=FALSE}
+Summary_Table <- Summary_Table %>% add_row(Method = "SVR", 
+                                           Score = round(svr_result_Score),
+                                           RMSE = round(svr_result_RMSE, digits = 4),
+                                           Error = paste0("[", min(svr_result), ",", max(svr_result), "]"))
+
+Result_Summary()
+```
+
+
+# 5. Conclusion
+
+In this paper I analyzed the NASA’s FD001 dataset, and built some prediction models which predicts the Remaining Useful Life (RUL) for the turbofan engines included in. I started with the Kaplan-Meier method, which actually cannot make predictions for the RUL, but it can improve our understanding about the data.
+Then, I built 4 prediction models. I chose some of the most popular and computationally light models, the _lm_, _kNN_, _randomForest_ and the _SVR_. 
+I used the scoring system provided by NASA as the optimality criterion to train and evaluate the models. As a result, the simplest model, the linear regression (_lm_) turned out to be the most inaccurate. The other three models’ performance were pretty much the same, but the _kNN_ performed a bit better than the others. Only the _randomForest_’s performance was a bit disappointing because this is the computationally heaviest model, and it couldn’t outperform the other 3 models. It provided only an average score. 
+
+The performance summary table and the density plot of the prediction errors by method are shown below. The medians are also marked on the density plots.
+
+```{r Table10_Final_results, echo=FALSE, message=FALSE, warning=FALSE}
+Result_Summary()
+```
+
+
+```{r Plot10_Error_Method, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+##Building the prediction error dataset
+lm_result <- cbind(lm_result, c("lm"))
+knn_result <- cbind(knn_result, c("knn"))
+rf_result <- cbind(rf_result, c("RF"))
+svr_result <- cbind(svr_result, c("SVR"))
+
+all_results <- as.data.frame(rbind(lm_result, knn_result, rf_result, svr_result))
+
+names(all_results) <- c("error", "method")
+
+##Prediction Error ~ Method Plot
+all_results %>%
+  ggplot(aes(as.numeric(error), method, group = method, fill = method)) +
+  stat_density_ridges(quantile_lines = TRUE, quantiles = 2, scale = 1, alpha = 0.2) +
+  scale_x_continuous(breaks = seq(-100, 100, by = 10)) +
+  scale_y_discrete(labels = c("SVR", "RF", "kNN", "lm")) +
+  labs(title="Prediction Error Density ~ Method", x = "Prediction Error", y = "Method")
+```
+
+If we would like to obtain more accuracy, we must use more complex models like neural networks, hybrid or boosted models. But with the complexity of the model, the hardware requirements get higher, and we can quickly end up with a model that cannot be trained on an average laptop.
